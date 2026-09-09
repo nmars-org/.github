@@ -1,0 +1,60 @@
+name: "Org Security Policy Auditor"
+
+on:
+  schedule:
+    # Runs daily at midnight
+    - cron: "0 0 * * *"
+  workflow_dispatch: # Allows manual triggers
+
+jobs:
+  discover-repos:
+    name: "Discover Public Repos"
+    runs-on: ubuntu-latest
+    outputs:
+      repo_matrix: ${{ steps.fetch-repos.outputs.repos }}
+    steps:
+      - name: "Fetch Public and Non-Archived Repos"
+        id: fetch-repos
+        env:
+          GH_TOKEN: ${{ secrets.ORG_MONITOR_TOKEN }}
+          ORG_NAME: "konflux-ci"
+        run: |
+          echo "Fetching repositories for organization: $ORG_NAME"
+          
+          # Queries the GitHub API with pagination. 
+          # Filters out private (.private == false) and archived (.archived == false) repos.
+          REPOS=$(gh api /orgs/$ORG_NAME/repos --paginate --jq '[.[] | select(.private == false and .archived == false) | {name: .name, full_name: .full_name, default_branch: .default_branch}]')
+          
+          # Compresses the JSON payload to fit within GitHub Actions output character limits
+          COMPRESSED_REPOS=$(echo "$REPOS" | jq -c '.')
+          
+          echo "repos=${COMPRESSED_REPOS}" >> $GITHUB_OUTPUT
+
+  audit-security-md:
+    name: "Audit: ${{ matrix.repo.name }}"
+    needs: discover-repos
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false  # Ensures other repo checks keep running if one repo fails
+      matrix:
+        repo: ${{ fromJson(needs.discover-repos.outputs.repo_matrix) }}
+    steps:
+      - name: "Check for SECURITY.md"
+        env:
+          GH_TOKEN: ${{ secrets.ORG_MONITOR_TOKEN }}
+        run: |
+          # Queries the Repository Contents endpoint specifically targeting the default branch ref
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://github.com{{ matrix.repo.full_name }}/contents/SECURITY.md?ref=${{ matrix.repo.default_branch }}")
+          
+          if [ "$STATUS_CODE" -eq 200 ]; then
+            echo "✅ SECURITY.md is present in the default branch (${{ matrix.repo.default_branch }}) of ${{ matrix.repo.name }}."
+          elif [ "$STATUS_CODE" -eq 404 ]; then
+            echo "::error title=Missing Security Policy::SECURITY.md is missing in the default branch of public repository: ${{ matrix.repo.name }}"
+            exit 1
+          else
+            echo "::warning title=API Error::Received unexpected HTTP status $STATUS_CODE while checking ${{ matrix.repo.name }}."
+            exit 1
+          fi
