@@ -17,7 +17,7 @@ jobs:
         id: fetch-repos
         env:
           GH_TOKEN: ${{ secrets.ORG_MONITOR_TOKEN }}
-          ORG_NAME: "konflux-ci"
+          ORG_NAME: "nmars-org"
         run: |
           echo "Fetching repositories for organization: $ORG_NAME"
           
