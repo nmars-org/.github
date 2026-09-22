@@ -10,29 +10,58 @@ jobs:
   discover-repos:
     name: "Discover Public Repos"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       repo_matrix: ${{ steps.fetch-repos.outputs.repos }}
+      repo_count: ${{ steps.fetch-repos.outputs.repo_count }}
     steps:
+      - name: "Check Out Exemption List"
+        uses: actions/checkout@v5
+
       - name: "Fetch Public and Non-Archived Repos"
         id: fetch-repos
         env:
           GH_TOKEN: ${{ secrets.ORG_MONITOR_TOKEN }}
           ORG_NAME: "nmars-org"
+          EXEMPTIONS_FILE: ".github/security-audit-exemptions.yml"
         run: |
           echo "Fetching repositories for organization: $ORG_NAME"
-          
-          # Queries the GitHub API with pagination. 
+
+          # Queries the GitHub API with pagination.
           # Filters out private (.private == false) and archived (.archived == false) repos.
           REPOS=$(gh api /orgs/$ORG_NAME/repos --paginate --jq '[.[] | select(.private == false and .archived == false) | {name: .name, full_name: .full_name, default_branch: .default_branch}]')
-          
+
+          # Reads the checked-in exemption list as a JSON array of repo names.
+          # An absent or empty `exemptions:` key yields [], exempting nothing.
+          EXEMPT=$(yq -o=json -I=0 '[.exemptions[].repo]' "$EXEMPTIONS_FILE")
+          echo "Exempt repositories: ${EXEMPT}"
+
+          # Warns about exemptions that no longer match a repo in scope, so the
+          # list does not silently rot as repos are renamed, archived, or deleted.
+          DISCOVERED=$(echo "$REPOS" | jq -c '[.[].name]')
+          jq -rn --argjson ex "$EXEMPT" --argjson found "$DISCOVERED" '$ex - $found | .[]' \
+            | while read -r STALE_REPO; do
+                echo "::warning title=Stale Exemption::'${STALE_REPO}' is exempted in ${EXEMPTIONS_FILE} but is not a public, non-archived repo in ${ORG_NAME}. Consider removing the entry."
+              done
+
           # Compresses the JSON payload to fit within GitHub Actions output character limits
-          COMPRESSED_REPOS=$(echo "$REPOS" | jq -c '.')
-          
+          COMPRESSED_REPOS=$(echo "$REPOS" | jq -c --argjson ex "$EXEMPT" '[.[] | select(.name | IN($ex[]) | not)]')
+
           echo "repos=${COMPRESSED_REPOS}" >> $GITHUB_OUTPUT
+          echo "repo_count=$(echo "$COMPRESSED_REPOS" | jq 'length')" >> $GITHUB_OUTPUT
+
+      - name: "Report Empty Audit Scope"
+        if: steps.fetch-repos.outputs.repo_count == '0'
+        run: |
+          echo "::notice title=No Repos to Audit::Every public, non-archived repo is exempt (or none were found). Skipping the audit job."
 
   audit-security-md:
     name: "Audit: ${{ matrix.repo.name }}"
     needs: discover-repos
+    # A matrix built from an empty array is a hard error in Actions, so skip the
+    # job outright rather than failing the run when nothing is in scope.
+    if: needs.discover-repos.outputs.repo_count != '0'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false  # Ensures other repo checks keep running if one repo fails
