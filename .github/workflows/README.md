@@ -19,12 +19,12 @@ repository — and each repo's file is a short stub linking back to it, so the
 policy itself stays centrally maintained and cannot drift copy by copy.
 
 This workflow is the detective control for that: it reports which repos are
-missing the file and gives maintainers a one-click path to add it or add the
-repository to an exemption list.
+missing the file. It is reporting only — it makes no changes to any repository,
+and remediation is left to a human.
 
 ## How it works
 
-Two jobs.
+Three jobs.
 
 ### `audit`
 
@@ -39,46 +39,50 @@ The job then subtracts the exemption list and emits the results as JSON.
 
 ### `report`
 
-Renders the Markdown run summary. Guarded with `if: always()` so a failed audit
-still explains itself on the run page instead of leaving it blank.
+Renders the Markdown run summary and emits a `::warning` annotation per
+non-compliant repo. Guarded with `if: always()` so a failed audit still explains
+itself on the run page instead of leaving it blank. It does **not** fail on
+non-compliance — rendering the report succeeded either way.
+
+### `compliance-gate`
+
+Holds the pass/fail decision, and nothing else. Fails when any in-scope repo is
+missing `SECURITY.md`. See [Reading the run status](#reading-the-run-status).
 
 ## What the report shows
 
 - Compliance counts and a 20-cell coverage bar
-- A linked table of non-compliant repos, each with a remediation link
+- A table of non-compliant repos with their default branch, each linked to the
+  repository
 - Collapsible lists of compliant repos and of exemptions with their reasons
 - A `::warning` annotation per non-compliant repo
 - A failing exit if anything is missing
 
-## Remediation links
+## Reading the run status
 
-Every non-compliant repo gets two one-click links, reflecting the two valid
-responses to a missing policy — add one, or declare the repo out of scope.
+GitHub Actions has **no amber "warning" conclusion** for a run, job, or step. A
+run is green, red, or grey. `continue-on-error: true` does not help — the step's
+`outcome` becomes `failure` but its `conclusion` becomes `success`, so it renders
+green. The Checks API supports a `neutral` conclusion, but the runner cannot emit
+it for its own jobs. There is an open feature request for a `warn-on-failure`
+flag; it does not exist today.
 
-| Link | Opens | Result |
-| :--- | :--- | :--- |
-| **🔀 Open PR** | the target repo's new-file editor, stub prefilled | adds `SECURITY.md` to that repo |
-| **🛡️ Exempt it** | this repo's exemption file, entry already appended | adds the repo to the exemption list |
+So the two failure modes are separated by **job** instead of by colour. Read the
+job list, not the run badge:
 
-Both carry `quick_pull=1`, which preselects _"Create a new branch for this
-commit and start a pull request"_. A link cannot create a commit, and a pull
-request cannot exist without one, so the maintainer still clicks **Commit
-changes** — but the default path is a pull request rather than a direct write
-to the default branch.
+| Job list | Meaning |
+| :--- | :--- |
+| ❌ `Audit SECURITY.md` | The workflow itself is broken — bad token, GraphQL failure, malformed exemption file, shell error. `Report Results` goes red explaining itself; `Compliance Gate` is **skipped**. |
+| ✅ audit, ✅ report, ❌ `Compliance Gate` | The workflow ran clean. Repos are non-conforming. This is the expected steady state until coverage hits 100%. |
+| ✅ all three | Every in-scope repo has a `SECURITY.md`. |
 
-That matters most on repos **without** branch protection. Protected repos force
-the pull request path regardless; unprotected ones would otherwise accept a
-direct commit to the default branch straight from the editor. The parameter
-sets the default selection, it does not lock it, so the summary carries a note
-telling reviewers not to switch the dialog back.
+`compliance-gate` carries no `if:` on purpose. The default `success()` condition
+means it is skipped rather than run whenever `audit` or `report` failed, so a
+broken workflow never also trips the compliance gate — the two signals stay
+independent.
 
-The **🛡️ Exempt it** link prefills the entry with a `TODO` reason, so a
-reviewer cannot merge a silent exemption without writing a justification.
-
-> `quick_pull=1` and `value=` are lightly documented. Verify they behave as
-> described in your environment before relying on them. If they do not, the
-> links still open the correct file in the correct editor, and the dialog still
-> offers the pull request option — it just will not be preselected.
+To run this as a pure dashboard, delete the `compliance-gate` job. The report and
+its warning annotations are unaffected.
 
 ## Exemptions
 
@@ -99,16 +103,7 @@ Entries that no longer match a repo in scope emit a **stale exemption** warning
 rather than failing silently, so the list does not rot as repos are renamed,
 archived, or deleted.
 
-The report's **🛡️ Exempt it** links are built by appending the proposed entry
-with `yq` rather than by string concatenation, so the prefilled result is valid
-YAML whatever shape the file is in — including `exemptions: []`, where a
-textual append would produce a broken document. Header comments are preserved.
-
-Because GitHub's `value=` parameter replaces the *whole* file, each link embeds
-the entire exemption file. At ~22 entries that is ~2.8 KB per URL against a
-practical ~8 KB ceiling, leaving room for roughly 60 entries. Past that the
-links will start to break and should be swapped for a plain edit link without
-prefill.
+The list is edited by hand. The workflow only reads it.
 
 ## Setup
 
@@ -123,13 +118,13 @@ prefill.
 
 ## Behavior notes
 
-- **The run fails when any in-scope repo is missing `SECURITY.md`.** Expect the
-  first run to be red. To use the workflow as a dashboard instead of a gate,
-  change the final `exit 1` in the report job to a warning.
-- **Repos with zero commits** have no default branch. They cannot hold a
-  `SECURITY.md` and cannot receive a pull request, so they are reported as
-  `⚠️ empty repo, no commits` rather than given a dead link. Consider exempting
-  them outright.
+- **The run fails when any in-scope repo is missing `SECURITY.md`**, via the
+  `compliance-gate` job. Expect the first run to be red, and see
+  [Reading the run status](#reading-the-run-status) for telling that apart from
+  a genuine workflow error.
+- **Repos with zero commits** have no default branch, so they cannot hold a
+  `SECURITY.md`. They are flagged as `_none — empty repo, no commits_` in the
+  branch column. Consider exempting them outright.
 - **Archived and private repos are out of scope** by construction, filtered in
   the GraphQL query rather than after the fact.
 - **Presence, not content.** The audit checks that `SECURITY.md` exists; it does
