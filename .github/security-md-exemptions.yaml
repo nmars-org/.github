@@ -1,0 +1,56 @@
+# Repositories exempt from the SECURITY.md check in
+# .github/workflows/monitor-security.yaml
+#
+# Entries are matched against the repository name (not the full name), since
+# the auditor only ever scans a single organization.
+#
+# Every exemption needs a reason. Prefer a tracking issue over an open-ended
+# justification -- an exemption with a ticket behind it is one someone will
+# eventually remove.
+
+exemptions:
+  - repo: curated-data
+    reason: "Not applicable"
+  - repo: .github
+    reason: "Not applicable"
+  - repo: brand-assets
+    reason: "Not applicable"
+  - repo: discussions
+    reason: "Not applicable"
+  - repo: e2e-tests
+    reason: "Not applicable"
+  - repo: .fullsend
+    reason: "Not applicable"
+  - repo: konflux-casc
+    reason: "Not applicable"
+  - repo: llm-compressor-container
+    reason: "Not applicable"
+  - repo: multi-arch-konflux-example
+    reason: "Not applicable"
+  - repo: multi-arch
+    reason: "Not applicable"
+  - repo: multi-version-konflux-stage-sample
+    reason: "Not applicable"
+  - repo: namespace-generator
+    reason: "Not applicable"
+  - repo: planning
+    reason: "Not applicable"
+  - repo: prioritize
+    reason: "Not applicable"
+  - repo: pr-review-webhook
+    reason: "Not applicable"
+  - repo: release-service-docs
+    reason: "Not applicable"
+  - repo: rpmbuild-pipeline-monorepo-mock-config-test
+    reason: "Not applicable"
+  - repo: rpmbuild-pipeline-test-sources
+    reason: "Not applicable"
+  - repo: sample-component-golang
+    reason: "Not applicable"
+  - repo: support
+    reason: "Not applicable"
+  - repo: testrepo
+    reason: "Not applicable"
+  - repo: tests-common-packages
+    reason: "Not applicable"
+

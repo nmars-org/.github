@@ -1,4 +1,4 @@
-name: "Org Security Policy Auditor"
+name: "Org SECURITY.md Auditor"
 
 on:
   schedule:
@@ -6,92 +6,284 @@ on:
     - cron: "0 0 * * *"
   workflow_dispatch: # Allows manual triggers
 
+permissions:
+  contents: read
+
+env:
+  ORG_NAME: "konflux-ci"
+  EXEMPTIONS_FILE: ".github/security-md-exemptions.yaml"
+  # The single source of truth for the org security policy. Every other repo's
+  # SECURITY.md is expected to be a short stub pointing here.
+  POLICY_URL: "https://github.com/konflux-ci/.github/blob/HEAD/SECURITY.md"
+
 jobs:
-  discover-repos:
-    name: "Discover Public Repos"
+  audit:
+    name: "Audit SECURITY.md"
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     outputs:
-      repo_matrix: ${{ steps.fetch-repos.outputs.repos }}
-      repo_count: ${{ steps.fetch-repos.outputs.repo_count }}
+      results: ${{ steps.audit.outputs.results }}
+      exempt: ${{ steps.audit.outputs.exempt }}
+      in_scope: ${{ steps.audit.outputs.in_scope }}
+      compliant: ${{ steps.audit.outputs.compliant }}
+      missing: ${{ steps.audit.outputs.missing }}
     steps:
       - name: "Check Out Exemption List"
         uses: actions/checkout@v5
 
-      - name: "Fetch Public and Non-Archived Repos"
-        id: fetch-repos
+      - name: "Audit Org Repositories"
+        id: audit
         env:
           GH_TOKEN: ${{ secrets.ORG_MONITOR_TOKEN }}
-          ORG_NAME: "nmars-org"
-          EXEMPTIONS_FILE: ".github/security-audit-exemptions.yml"
         run: |
-          echo "Fetching repositories for organization: $ORG_NAME"
+          set -euo pipefail
 
-          # Queries the GitHub API with pagination.
-          # Filters out private (.private == false) and archived (.archived == false) repos.
-          REPOS=$(gh api /orgs/$ORG_NAME/repos --paginate --jq '[.[] | select(.private == false and .archived == false) | {name: .name, full_name: .full_name, default_branch: .default_branch}]')
+          # A single GraphQL query returns each repo *and* whether SECURITY.md
+          # exists on its default branch, 100 repos per page. This replaces one
+          # REST list call plus one contents call per repo.
+          read -r -d '' QUERY <<'GRAPHQL' || true
+          query($org: String!, $endCursor: String) {
+            organization(login: $org) {
+              repositories(
+                first: 100
+                after: $endCursor
+                privacy: PUBLIC
+                isArchived: false
+                orderBy: {field: NAME, direction: ASC}
+              ) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  name
+                  url
+                  defaultBranchRef { name }
+                  securityMd: object(expression: "HEAD:SECURITY.md") { __typename }
+                }
+              }
+            }
+          }
+          GRAPHQL
 
-          # Reads the checked-in exemption list as a JSON array of repo names.
-          # An absent or empty `exemptions:` key yields [], exempting nothing.
-          EXEMPT=$(yq -o=json -I=0 '[.exemptions[].repo]' "$EXEMPTIONS_FILE")
-          echo "Exempt repositories: ${EXEMPT}"
+          ALL=$(
+            gh api graphql --paginate -f query="$QUERY" -F org="$ORG_NAME" |
+              jq -sc '[.[].data.organization.repositories.nodes[]]'
+          )
+          echo "Discovered $(jq 'length' <<<"$ALL") public, non-archived repos."
 
-          # Warns about exemptions that no longer match a repo in scope, so the
+          # Always produce a JSON array, including when the key is absent.
+          EXEMPT=$(yq -o=json -I=0 '(.exemptions // []) | map(.repo)' "$EXEMPTIONS_FILE")
+          EXEMPT_DETAIL=$(yq -o=json -I=0 '(.exemptions // [])' "$EXEMPTIONS_FILE")
+
+          # Warn about exemptions that no longer match a repo in scope, so the
           # list does not silently rot as repos are renamed, archived, or deleted.
-          DISCOVERED=$(echo "$REPOS" | jq -c '[.[].name]')
-          jq -rn --argjson ex "$EXEMPT" --argjson found "$DISCOVERED" '$ex - $found | .[]' \
-            | while read -r STALE_REPO; do
-                echo "::warning title=Stale Exemption::'${STALE_REPO}' is exempted in ${EXEMPTIONS_FILE} but is not a public, non-archived repo in ${ORG_NAME}. Consider removing the entry."
-              done
+          jq -rn \
+            --argjson ex "$EXEMPT" \
+            --argjson found "$(jq -c '[.[].name]' <<<"$ALL")" \
+            '$ex - $found | .[]' |
+            while read -r STALE_REPO; do
+              echo "::warning title=Stale Exemption::'${STALE_REPO}' is exempted in ${EXEMPTIONS_FILE} but is not a public, non-archived repo in ${ORG_NAME}. Consider removing the entry."
+            done
 
-          # Compresses the JSON payload to fit within GitHub Actions output character limits
-          COMPRESSED_REPOS=$(echo "$REPOS" | jq -c --argjson ex "$EXEMPT" '[.[] | select(.name | IN($ex[]) | not)]')
+          RESULTS=$(
+            jq -c --argjson ex "$EXEMPT" '
+              [ .[]
+                | select(.name | IN($ex[]) | not)
+                | {
+                    name: .name,
+                    url: .url,
+                    branch: (.defaultBranchRef.name // "HEAD"),
+                    # A repo with no commits has no default branch ref. It cannot
+                    # hold a SECURITY.md and cannot receive a pull request, so the
+                    # report links nowhere for these.
+                    empty: (.defaultBranchRef == null),
+                    compliant: (.securityMd != null)
+                  }
+              ] | sort_by(.compliant, .name)
+            ' <<<"$ALL"
+          )
 
-          echo "repos=${COMPRESSED_REPOS}" >> $GITHUB_OUTPUT
-          echo "repo_count=$(echo "$COMPRESSED_REPOS" | jq 'length')" >> $GITHUB_OUTPUT
+          {
+            printf 'results=%s\n'   "$RESULTS"
+            printf 'exempt=%s\n'    "$EXEMPT_DETAIL"
+            printf 'in_scope=%s\n'  "$(jq 'length' <<<"$RESULTS")"
+            printf 'compliant=%s\n' "$(jq '[.[] | select(.compliant)] | length' <<<"$RESULTS")"
+            printf 'missing=%s\n'   "$(jq '[.[] | select(.compliant | not)] | length' <<<"$RESULTS")"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: "Report Empty Audit Scope"
-        if: steps.fetch-repos.outputs.repo_count == '0'
-        run: |
-          echo "::notice title=No Repos to Audit::Every public, non-archived repo is exempt (or none were found). Skipping the audit job."
-
-  audit-security-md:
-    name: "Audit: ${{ matrix.repo.name }}"
-    needs: discover-repos
-    # A matrix built from an empty array is a hard error in Actions, so skip the
-    # job outright rather than failing the run when nothing is in scope.
-    if: needs.discover-repos.outputs.repo_count != '0'
+  report:
+    name: "Report Results"
+    needs: audit
+    # Renders the summary even if the audit step itself failed, so a partial or
+    # failed run still explains itself on the run page.
+    if: always()
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false  # Ensures other repo checks keep running if one repo fails
-      matrix:
-        repo: ${{ fromJson(needs.discover-repos.outputs.repo_matrix) }}
     steps:
-      - name: "Check for SECURITY.md"
-        env:
-          GH_TOKEN: ${{ secrets.ORG_MONITOR_TOKEN }}
-          REPO_FULL_NAME: ${{ matrix.repo.full_name }}
-          DEFAULT_BRANCH: ${{ matrix.repo.default_branch }}
-          REPO_NAME: ${{ matrix.repo.name }}
+      - name: "Handle Failed Audit"
+        if: needs.audit.result != 'success'
         run: |
-          API_URL="https://api.github.com/repos/${REPO_FULL_NAME}/contents/SECURITY.md"
+          {
+            echo "## 🔐 Org Security Policy Audit"
+            echo
+            echo "> [!CAUTION]"
+            echo "> The audit job did not complete (\`${{ needs.audit.result }}\`). No results to report."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
-          STATUS_CODE=$(curl --silent --show-error \
-            --output /dev/null \
-            --write-out "%{http_code}" \
-            --get \
-            --header "Authorization: Bearer ${GH_TOKEN}" \
-            --header "Accept: application/vnd.github+json" \
-            --data-urlencode "ref=${DEFAULT_BRANCH}" \
-            "${API_URL}")
+      # Needed to build the "exempt instead" links, which prefill the editor
+      # with this repo's exemption file plus the proposed new entry.
+      - name: "Check Out Exemption List"
+        if: needs.audit.result == 'success'
+        uses: actions/checkout@v5
 
-          if [ "$STATUS_CODE" -eq 200 ]; then
-            echo "✅ SECURITY.md is present in the default branch (${DEFAULT_BRANCH}) of ${REPO_NAME}."
-          elif [ "$STATUS_CODE" -eq 404 ]; then
-            echo "::error title=Missing Security Policy::SECURITY.md is missing in the default branch of public repository: ${REPO_NAME}"
-            exit 1
+      - name: "Render Summary"
+        if: needs.audit.result == 'success'
+        env:
+          RESULTS: ${{ needs.audit.outputs.results }}
+          EXEMPT: ${{ needs.audit.outputs.exempt }}
+          IN_SCOPE: ${{ needs.audit.outputs.in_scope }}
+          COMPLIANT: ${{ needs.audit.outputs.compliant }}
+          MISSING: ${{ needs.audit.outputs.missing }}
+          SELF_REPO: ${{ github.repository }}
+          SELF_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          # The stub every non-canonical repo is expected to carry. Used both as
+          # the documented target state and as prefilled content in the
+          # "create file" deep links below.
+          read -r -d '' STUB <<STUBEOF || true
+          # Security Policy
+
+          ${ORG_NAME} maintains a single, organization-wide security policy.
+
+          Please see **[${ORG_NAME}/.github/SECURITY.md](${POLICY_URL})** for how to
+          report a vulnerability, our response timeline, and submission guidelines.
+
+          STUBEOF
+
+          PCT=0
+          if [ "$IN_SCOPE" -gt 0 ]; then
+            PCT=$(( COMPLIANT * 100 / IN_SCOPE ))
+          fi
+          # Build a 20-cell bar. Guard both ends: `printf 'X%.0s'` with an empty
+          # argument list still emits the literal once, which would add a stray
+          # cell at exactly 0% and 100%.
+          FILLED=$(( PCT / 5 ))
+          BAR=""
+          if [ "$FILLED" -gt 0 ]; then
+            BAR=$(printf '█%.0s' $(seq 1 "$FILLED"))
+          fi
+          if [ "$FILLED" -lt 20 ]; then
+            BAR="${BAR}$(printf '░%.0s' $(seq 1 $(( 20 - FILLED ))))"
+          fi
+
+          if [ "$MISSING" -eq 0 ]; then
+            BADGE="> [!TIP]
+          > **All ${IN_SCOPE} in-scope repositories have a \`SECURITY.md\`.** 🎉"
           else
-            echo "::error title=API Error::Received unexpected HTTP status ${STATUS_CODE} while checking ${REPO_NAME}."
+            BADGE="> [!WARNING]
+          > **${MISSING} of ${IN_SCOPE} in-scope repositories are missing \`SECURITY.md\`.**"
+          fi
+
+          {
+            echo "## 🔐 Org Security Policy Audit"
+            echo
+            echo "[\`${ORG_NAME}\`](https://github.com/${ORG_NAME}) · audited $(date -u '+%Y-%m-%d %H:%M UTC') · [canonical policy](${POLICY_URL})"
+            echo
+            echo "$BADGE"
+            echo
+            echo "| Metric | Count |"
+            echo "| :--- | ---: |"
+            echo "| ✅ Compliant | **${COMPLIANT}** |"
+            echo "| ❌ Missing \`SECURITY.md\` | **${MISSING}** |"
+            echo "| 🛡️ Exempt | $(jq 'length' <<<"$EXEMPT") |"
+            echo "| **In scope** | **${IN_SCOPE}** |"
+            echo
+            echo "**Coverage ${PCT}%** \`${BAR}\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Non-compliant repos, each with a one-click link into GitHub's new-file
+          # editor, prefilled with the stub and targeting the default branch.
+          #
+          # `quick_pull=1` preselects "Create a new branch for this commit and
+          # start a pull request" in the commit dialog, so the default path is a
+          # PR rather than a direct commit to the default branch. The maintainer
+          # still has to click Commit -- a link cannot create a commit, and a pull
+          # request cannot exist without one.
+          if [ "$MISSING" -gt 0 ]; then
+            # Precompute, per non-compliant repo, the full exemption file with
+            # that repo appended. yq is used rather than a text append so the
+            # result is valid YAML whatever shape the source is in -- including
+            # `exemptions: []`, where appending a list item textually would
+            # produce a broken document. Header comments are preserved.
+            EXEMPT_LINKS=$(
+              jq -r '.[] | select(.compliant | not) | .name' <<<"$RESULTS" |
+                while read -r R; do
+                  PROPOSED=$(
+                    yq ".exemptions += [{\"repo\": \"${R}\", \"reason\": \"TODO: justify this exemption\"}]" \
+                      "$EXEMPTIONS_FILE"
+                  )
+                  jq -cn --arg r "$R" --arg v "$PROPOSED" '{($r): $v}'
+                done | jq -sc 'add // {}'
+            )
+
+            {
+              echo "### ❌ Missing \`SECURITY.md\` (${MISSING})"
+              echo
+              echo "| Repository | Branch | Add policy | Not applicable? |"
+              echo "| :--- | :--- | :--- | :--- |"
+              jq -r \
+                --arg stub "$STUB" \
+                --arg self "$SELF_REPO" \
+                --arg selfbranch "$SELF_BRANCH" \
+                --arg exfile "$EXEMPTIONS_FILE" \
+                --argjson exlinks "$EXEMPT_LINKS" '
+                .[] | select(.compliant | not)
+                | . as $r
+                | ("https://github.com/\($self)/edit/\($selfbranch)/\($exfile)?value=\($exlinks[$r.name] // "" | @uri)&quick_pull=1") as $exempt
+                | if .empty then
+                    "| [\(.name)](\(.url)) | _none_ | ⚠️ empty repo, no commits | [🛡️ Exempt it](\($exempt)) |"
+                  else
+                    "| [\(.name)](\(.url)) | `\(.branch)` | [🔀 Open PR](\(.url)/new/\(.branch)?filename=SECURITY.md&value=\($stub | @uri)&quick_pull=1) | [🛡️ Exempt it](\($exempt)) |"
+                  end
+              ' <<<"$RESULTS"
+              echo
+              echo "> [!NOTE]"
+              echo "> **🔀 Open PR** opens the target repo's editor with the stub prefilled."
+              echo "> **🛡️ Exempt it** opens \`${EXEMPTIONS_FILE}\` in"
+              echo "> [\`${SELF_REPO}\`](https://github.com/${SELF_REPO}) with the repo already"
+              echo "> appended — fill in the \`TODO\` reason before committing."
+              echo ">"
+              echo "> Both preset the commit dialog to _create a branch and open a pull"
+              echo "> request_; review, then click **Commit changes**. Repos with branch"
+              echo "> protection enforce that path regardless, but on unprotected repos take"
+              echo "> care not to switch back to committing directly to the default branch."
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          {
+            echo "<details>"
+            echo "<summary>✅ Compliant (${COMPLIANT})</summary>"
+            echo
+            jq -r '.[] | select(.compliant) | "- [\(.name)](\(.url)/blob/\(.branch)/SECURITY.md)"' <<<"$RESULTS"
+            echo
+            echo "</details>"
+            echo
+            echo "<details>"
+            echo "<summary>🛡️ Exempt ($(jq 'length' <<<"$EXEMPT"))</summary>"
+            echo
+            echo "| Repository | Reason |"
+            echo "| :--- | :--- |"
+            jq -r '.[] | "| `\(.repo)` | \(.reason // "_no reason given_") |"' <<<"$EXEMPT"
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Mirror the headline into the run's annotation stream.
+          if [ "$MISSING" -gt 0 ]; then
+            jq -r '.[] | select(.compliant | not) | "::warning title=Missing Security Policy::\(.name) has no SECURITY.md on its default branch."' <<<"$RESULTS"
+            echo "::error title=Security Policy Audit Failed::${MISSING} of ${IN_SCOPE} in-scope repositories are missing SECURITY.md. See the run summary for details."
             exit 1
           fi
+
+          echo "::notice title=Security Policy Audit Passed::All ${IN_SCOPE} in-scope repositories have a SECURITY.md."
