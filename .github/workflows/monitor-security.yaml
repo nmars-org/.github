@@ -15,6 +15,7 @@ env:
   # The single source of truth for the org security policy. Every other repo's
   # SECURITY.md is expected to be a short stub pointing here.
   POLICY_URL: "https://github.com/konflux-ci/.github/blob/HEAD/SECURITY.md"
+  EXEMPTIONS_URL: "https://github.com/konflux-ci/.github/blob/HEAD/${EXEMPTIONS_FILE}"
 
 jobs:
   audit:
@@ -90,9 +91,8 @@ jobs:
                     name: .name,
                     url: .url,
                     branch: (.defaultBranchRef.name // "HEAD"),
-                    # A repo with no commits has no default branch ref. It cannot
-                    # hold a SECURITY.md and cannot receive a pull request, so the
-                    # report links nowhere for these.
+                    # A repo with no commits has no default branch ref, so it
+                    # cannot hold a SECURITY.md. Flagged separately in the report.
                     empty: (.defaultBranchRef == null),
                     compliant: (.securityMd != null)
                   }
@@ -127,12 +127,6 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit 1
 
-      # Needed to build the "exempt instead" links, which prefill the editor
-      # with this repo's exemption file plus the proposed new entry.
-      - name: "Check Out Exemption List"
-        if: needs.audit.result == 'success'
-        uses: actions/checkout@v5
-
       - name: "Render Summary"
         if: needs.audit.result == 'success'
         env:
@@ -141,23 +135,8 @@ jobs:
           IN_SCOPE: ${{ needs.audit.outputs.in_scope }}
           COMPLIANT: ${{ needs.audit.outputs.compliant }}
           MISSING: ${{ needs.audit.outputs.missing }}
-          SELF_REPO: ${{ github.repository }}
-          SELF_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-
-          # The stub every non-canonical repo is expected to carry. Used both as
-          # the documented target state and as prefilled content in the
-          # "create file" deep links below.
-          read -r -d '' STUB <<STUBEOF || true
-          # Security Policy
-
-          ${ORG_NAME} maintains a single, organization-wide security policy.
-
-          Please see **[${ORG_NAME}/.github/SECURITY.md](${POLICY_URL})** for how to
-          report a vulnerability, our response timeline, and submission guidelines.
-
-          STUBEOF
 
           PCT=0
           if [ "$IN_SCOPE" -gt 0 ]; then
@@ -201,62 +180,27 @@ jobs:
             echo
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Non-compliant repos, each with a one-click link into GitHub's new-file
-          # editor, prefilled with the stub and targeting the default branch.
-          #
-          # `quick_pull=1` preselects "Create a new branch for this commit and
-          # start a pull request" in the commit dialog, so the default path is a
-          # PR rather than a direct commit to the default branch. The maintainer
-          # still has to click Commit -- a link cannot create a commit, and a pull
-          # request cannot exist without one.
+          # Non-compliant repos, listed with a link to the repository itself.
+          # Reporting only -- remediation is left to a human.
           if [ "$MISSING" -gt 0 ]; then
-            # Precompute, per non-compliant repo, the full exemption file with
-            # that repo appended. yq is used rather than a text append so the
-            # result is valid YAML whatever shape the source is in -- including
-            # `exemptions: []`, where appending a list item textually would
-            # produce a broken document. Header comments are preserved.
-            EXEMPT_LINKS=$(
-              jq -r '.[] | select(.compliant | not) | .name' <<<"$RESULTS" |
-                while read -r R; do
-                  PROPOSED=$(
-                    yq ".exemptions += [{\"repo\": \"${R}\", \"reason\": \"TODO: justify this exemption\"}]" \
-                      "$EXEMPTIONS_FILE"
-                  )
-                  jq -cn --arg r "$R" --arg v "$PROPOSED" '{($r): $v}'
-                done | jq -sc 'add // {}'
-            )
-
             {
               echo "### ❌ Missing \`SECURITY.md\` (${MISSING})"
               echo
-              echo "| Repository | Branch | Add policy | Not applicable? |"
-              echo "| :--- | :--- | :--- | :--- |"
-              jq -r \
-                --arg stub "$STUB" \
-                --arg self "$SELF_REPO" \
-                --arg selfbranch "$SELF_BRANCH" \
-                --arg exfile "$EXEMPTIONS_FILE" \
-                --argjson exlinks "$EXEMPT_LINKS" '
+              echo "| Repository | Default branch |"
+              echo "| :--- | :--- |"
+              jq -r '
                 .[] | select(.compliant | not)
-                | . as $r
-                | ("https://github.com/\($self)/edit/\($selfbranch)/\($exfile)?value=\($exlinks[$r.name] // "" | @uri)&quick_pull=1") as $exempt
                 | if .empty then
-                    "| [\(.name)](\(.url)) | _none_ | ⚠️ empty repo, no commits | [🛡️ Exempt it](\($exempt)) |"
+                    "| [\(.name)](\(.url)) | _none — empty repo, no commits_ |"
                   else
-                    "| [\(.name)](\(.url)) | `\(.branch)` | [🔀 Open PR](\(.url)/new/\(.branch)?filename=SECURITY.md&value=\($stub | @uri)&quick_pull=1) | [🛡️ Exempt it](\($exempt)) |"
+                    "| [\(.name)](\(.url)) | `\(.branch)` |"
                   end
               ' <<<"$RESULTS"
               echo
               echo "> [!NOTE]"
-              echo "> **🔀 Open PR** opens the target repo's editor with the stub prefilled."
-              echo "> **🛡️ Exempt it** opens \`${EXEMPTIONS_FILE}\` in"
-              echo "> [\`${SELF_REPO}\`](https://github.com/${SELF_REPO}) with the repo already"
-              echo "> appended — fill in the \`TODO\` reason before committing."
-              echo ">"
-              echo "> Both preset the commit dialog to _create a branch and open a pull"
-              echo "> request_; review, then click **Commit changes**. Repos with branch"
-              echo "> protection enforce that path regardless, but on unprotected repos take"
-              echo "> care not to switch back to committing directly to the default branch."
+              echo "> Each repo above needs a \`SECURITY.md\` on its default branch"
+              echo "> pointing at the [canonical policy](${POLICY_URL}). If the check does"
+              echo "> not apply to a repo, add it to the [exemptions file](${EXEMPTIONS_URL}) with a reason."
               echo
             } >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -279,11 +223,42 @@ jobs:
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Mirror the headline into the run's annotation stream.
+          # Mirror the per-repo findings into the run's annotation stream. This
+          # step deliberately does not fail: rendering the report succeeded, and
+          # whether the org is compliant is decided by the compliance-gate job.
           if [ "$MISSING" -gt 0 ]; then
             jq -r '.[] | select(.compliant | not) | "::warning title=Missing Security Policy::\(.name) has no SECURITY.md on its default branch."' <<<"$RESULTS"
-            echo "::error title=Security Policy Audit Failed::${MISSING} of ${IN_SCOPE} in-scope repositories are missing SECURITY.md. See the run summary for details."
+          fi
+
+  # Separates the two ways this workflow can go red.
+  #
+  #   audit / report red  -> the workflow itself is broken (bad token, API
+  #                          failure, malformed exemption file, shell error).
+  #   compliance-gate red -> the workflow ran clean; repos are non-conforming.
+  #
+  # GitHub Actions has no amber "warning" conclusion for a run, job, or step --
+  # `continue-on-error` renders green, and the runner cannot emit the `neutral`
+  # conclusion the Checks API supports. Splitting the gate into its own job is
+  # what makes the failure mode legible at a glance in the job list instead.
+  #
+  # No `if:` here on purpose: the default `success()` means this job is *skipped*
+  # rather than run whenever audit or report failed, so a broken workflow never
+  # also trips the compliance gate.
+  compliance-gate:
+    name: "Compliance Gate"
+    needs: [audit, report]
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Fail If Non-Compliant"
+        env:
+          IN_SCOPE: ${{ needs.audit.outputs.in_scope }}
+          MISSING: ${{ needs.audit.outputs.missing }}
+        run: |
+          set -euo pipefail
+
+          if [ "$MISSING" -gt 0 ]; then
+            echo "::error title=Non-Compliant Repositories::${MISSING} of ${IN_SCOPE} in-scope repositories are missing SECURITY.md. The audit itself ran clean -- see the run summary for the list."
             exit 1
           fi
 
-          echo "::notice title=Security Policy Audit Passed::All ${IN_SCOPE} in-scope repositories have a SECURITY.md."
+          echo "::notice title=Compliant::All ${IN_SCOPE} in-scope repositories have a SECURITY.md."
