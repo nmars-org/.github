@@ -9,6 +9,8 @@
 # eventually remove.
 
 exemptions:
+  - repo: community-operators-prod
+    reason: Fork of third-party OperatorHub metadata with its own upstream policy.
   - repo: curated-data
     reason: "Not applicable"
   - repo: .github
