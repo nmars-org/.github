@@ -15,7 +15,15 @@ env:
   # The single source of truth for the org security policy. Every other repo's
   # SECURITY.md is expected to be a short stub pointing here.
   POLICY_URL: "https://github.com/konflux-ci/.github/blob/HEAD/SECURITY.md"
-  EXEMPTIONS_URL: "https://github.com/konflux-ci/.github/blob/HEAD/${EXEMPTIONS_FILE}"
+  # Extended regex, matched case-insensitively against each SECURITY.md body to
+  # decide whether it actually points back at the canonical policy.
+  #
+  # Deliberately tolerant rather than an exact match on POLICY_URL: real stubs
+  # in the wild link via /blob/main/, /blob/HEAD/, /security/policy, or
+  # ?tab=security-ov-file, and all of those are correct. Matching the repo
+  # reference accepts every form. Single-quoted so YAML leaves the backslashes
+  # alone.
+  POLICY_LINK_PATTERN: 'github\.com/konflux-ci/\.github'
 
 jobs:
   audit:
@@ -27,6 +35,7 @@ jobs:
       in_scope: ${{ steps.audit.outputs.in_scope }}
       compliant: ${{ steps.audit.outputs.compliant }}
       missing: ${{ steps.audit.outputs.missing }}
+      unlinked: ${{ steps.audit.outputs.unlinked }}
     steps:
       - name: "Check Out Exemption List"
         uses: actions/checkout@v5
@@ -38,9 +47,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          # A single GraphQL query returns each repo *and* whether SECURITY.md
-          # exists on its default branch, 100 repos per page. This replaces one
-          # REST list call plus one contents call per repo.
+          # A single GraphQL query returns each repo, whether SECURITY.md exists
+          # on its default branch, *and* the file's text, 100 repos per page.
+          # This replaces one REST list call plus one contents call per repo.
+          #
+          # Pulling `text` inline is what makes the content check free: no extra
+          # request per repo. Measured at 134 repos it adds ~24 KB to the
+          # response. `text` is null for binary blobs, which count as unlinked.
           read -r -d '' QUERY <<'GRAPHQL' || true
           query($org: String!, $endCursor: String) {
             organization(login: $org) {
@@ -56,7 +69,9 @@ jobs:
                   name
                   url
                   defaultBranchRef { name }
-                  securityMd: object(expression: "HEAD:SECURITY.md") { __typename }
+                  securityMd: object(expression: "HEAD:SECURITY.md") {
+                    ... on Blob { text }
+                  }
                 }
               }
             }
@@ -84,7 +99,7 @@ jobs:
             done
 
           RESULTS=$(
-            jq -c --argjson ex "$EXEMPT" '
+            jq -c --argjson ex "$EXEMPT" --arg pat "$POLICY_LINK_PATTERN" '
               [ .[]
                 | select(.name | IN($ex[]) | not)
                 | {
@@ -94,9 +109,24 @@ jobs:
                     # A repo with no commits has no default branch ref, so it
                     # cannot hold a SECURITY.md. Flagged separately in the report.
                     empty: (.defaultBranchRef == null),
-                    compliant: (.securityMd != null)
+                    # Three states, not two: the file can be absent, present but
+                    # not pointing at the canonical policy, or correct.
+                    #
+                    # The blob text is tested here and then discarded. It must
+                    # not reach RESULTS -- job outputs are capped at 1 MB, and
+                    # carrying every policy body would blow past that.
+                    status: (
+                      if .securityMd == null then "missing"
+                      elif ((.securityMd.text // "") | test($pat; "i")) then "ok"
+                      else "unlinked"
+                      end
+                    )
                   }
-              ] | sort_by(.compliant, .name)
+              ]
+              # Problems first, so the report reads worst-to-best. Object
+              # indexing rather than `[...] | index(.status)`, which would
+              # rebind `.` to the array and lose the element.
+              | sort_by({"missing": 0, "unlinked": 1, "ok": 2}[.status], .name)
             ' <<<"$ALL"
           )
 
@@ -104,8 +134,9 @@ jobs:
             printf 'results=%s\n'   "$RESULTS"
             printf 'exempt=%s\n'    "$EXEMPT_DETAIL"
             printf 'in_scope=%s\n'  "$(jq 'length' <<<"$RESULTS")"
-            printf 'compliant=%s\n' "$(jq '[.[] | select(.compliant)] | length' <<<"$RESULTS")"
-            printf 'missing=%s\n'   "$(jq '[.[] | select(.compliant | not)] | length' <<<"$RESULTS")"
+            printf 'compliant=%s\n' "$(jq '[.[] | select(.status == "ok")]       | length' <<<"$RESULTS")"
+            printf 'missing=%s\n'   "$(jq '[.[] | select(.status == "missing")]  | length' <<<"$RESULTS")"
+            printf 'unlinked=%s\n'  "$(jq '[.[] | select(.status == "unlinked")] | length' <<<"$RESULTS")"
           } >> "$GITHUB_OUTPUT"
 
   report:
@@ -135,8 +166,16 @@ jobs:
           IN_SCOPE: ${{ needs.audit.outputs.in_scope }}
           COMPLIANT: ${{ needs.audit.outputs.compliant }}
           MISSING: ${{ needs.audit.outputs.missing }}
+          UNLINKED: ${{ needs.audit.outputs.unlinked }}
         run: |
           set -euo pipefail
+
+          # Built from the running repo rather than hardcoded, so it stays
+          # correct if this workflow is moved into another org's .github repo.
+          EXEMPTIONS_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/${EXEMPTIONS_FILE}"
+
+          # Everything that is not fully conforming, for the headline.
+          NONCONFORMING=$(( MISSING + UNLINKED ))
 
           PCT=0
           if [ "$IN_SCOPE" -gt 0 ]; then
@@ -154,12 +193,12 @@ jobs:
             BAR="${BAR}$(printf '░%.0s' $(seq 1 $(( 20 - FILLED ))))"
           fi
 
-          if [ "$MISSING" -eq 0 ]; then
+          if [ "$NONCONFORMING" -eq 0 ]; then
             BADGE="> [!TIP]
-          > **All ${IN_SCOPE} in-scope repositories have a \`SECURITY.md\`.** 🎉"
+          > **All ${IN_SCOPE} in-scope repositories carry a \`SECURITY.md\` pointing at the canonical policy.** 🎉"
           else
             BADGE="> [!WARNING]
-          > **${MISSING} of ${IN_SCOPE} in-scope repositories are missing \`SECURITY.md\`.**"
+          > **${NONCONFORMING} of ${IN_SCOPE} in-scope repositories are not conforming** — ${MISSING} missing \`SECURITY.md\`, ${UNLINKED} not linking to the canonical policy."
           fi
 
           {
@@ -173,6 +212,7 @@ jobs:
             echo "| :--- | ---: |"
             echo "| ✅ Compliant | **${COMPLIANT}** |"
             echo "| ❌ Missing \`SECURITY.md\` | **${MISSING}** |"
+            echo "| 🔗 Present but not linked to canonical | **${UNLINKED}** |"
             echo "| 🛡️ Exempt | $(jq 'length' <<<"$EXEMPT") |"
             echo "| **In scope** | **${IN_SCOPE}** |"
             echo
@@ -189,7 +229,7 @@ jobs:
               echo "| Repository | Default branch |"
               echo "| :--- | :--- |"
               jq -r '
-                .[] | select(.compliant | not)
+                .[] | select(.status == "missing")
                 | if .empty then
                     "| [\(.name)](\(.url)) | _none — empty repo, no commits_ |"
                   else
@@ -205,11 +245,35 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+          # Repos that have a SECURITY.md but whose content never references the
+          # canonical policy -- typically a hand-written policy that will drift.
+          if [ "$UNLINKED" -gt 0 ]; then
+            {
+              echo "### 🔗 Not linked to the canonical policy (${UNLINKED})"
+              echo
+              echo "| Repository | \`SECURITY.md\` |"
+              echo "| :--- | :--- |"
+              jq -r '
+                .[] | select(.status == "unlinked")
+                | "| [\(.name)](\(.url)) | [view file](\(.url)/blob/\(.branch)/SECURITY.md) |"
+              ' <<<"$RESULTS"
+              echo
+              echo "> [!NOTE]"
+              echo "> These repos **do** have a \`SECURITY.md\`, but its content does not"
+              echo "> reference the [canonical policy](${POLICY_URL}), so it is a separate"
+              echo "> copy that has to be maintained on its own and will drift."
+              echo ">"
+              echo "> Replace the body with a stub linking to the canonical policy, or"
+              echo "> exempt the repo if it is intended to keep its own policy."
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
           {
             echo "<details>"
             echo "<summary>✅ Compliant (${COMPLIANT})</summary>"
             echo
-            jq -r '.[] | select(.compliant) | "- [\(.name)](\(.url)/blob/\(.branch)/SECURITY.md)"' <<<"$RESULTS"
+            jq -r '.[] | select(.status == "ok") | "- [\(.name)](\(.url)/blob/\(.branch)/SECURITY.md)"' <<<"$RESULTS"
             echo
             echo "</details>"
             echo
@@ -226,9 +290,15 @@ jobs:
           # Mirror the per-repo findings into the run's annotation stream. This
           # step deliberately does not fail: rendering the report succeeded, and
           # whether the org is compliant is decided by the compliance-gate job.
-          if [ "$MISSING" -gt 0 ]; then
-            jq -r '.[] | select(.compliant | not) | "::warning title=Missing Security Policy::\(.name) has no SECURITY.md on its default branch."' <<<"$RESULTS"
-          fi
+          jq -r '
+            .[]
+            | if .status == "missing" then
+                "::warning title=Missing Security Policy::\(.name) has no SECURITY.md on its default branch."
+              elif .status == "unlinked" then
+                "::warning title=Unlinked Security Policy::\(.name) has a SECURITY.md that does not reference the canonical policy."
+              else empty
+              end
+          ' <<<"$RESULTS"
 
   # Separates the two ways this workflow can go red.
   #
@@ -253,12 +323,19 @@ jobs:
         env:
           IN_SCOPE: ${{ needs.audit.outputs.in_scope }}
           MISSING: ${{ needs.audit.outputs.missing }}
+          UNLINKED: ${{ needs.audit.outputs.unlinked }}
         run: |
           set -euo pipefail
 
-          if [ "$MISSING" -gt 0 ]; then
-            echo "::error title=Non-Compliant Repositories::${MISSING} of ${IN_SCOPE} in-scope repositories are missing SECURITY.md. The audit itself ran clean -- see the run summary for the list."
+          # Both states are non-conforming against the stated goal: every
+          # in-scope repo carries a SECURITY.md that points at the single
+          # canonical policy. To treat a hand-written policy as acceptable
+          # instead, drop UNLINKED from this sum and report it as advisory only.
+          NONCONFORMING=$(( MISSING + UNLINKED ))
+
+          if [ "$NONCONFORMING" -gt 0 ]; then
+            echo "::error title=Non-Conforming Repositories::${NONCONFORMING} of ${IN_SCOPE} in-scope repositories are non-conforming -- ${MISSING} missing SECURITY.md, ${UNLINKED} not linking to the canonical policy. The audit itself ran clean; see the run summary for the lists."
             exit 1
           fi
 
-          echo "::notice title=Compliant::All ${IN_SCOPE} in-scope repositories have a SECURITY.md."
+          echo "::notice title=Compliant::All ${IN_SCOPE} in-scope repositories carry a SECURITY.md linking to the canonical policy."

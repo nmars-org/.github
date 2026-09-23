@@ -29,13 +29,46 @@ Three jobs.
 ### `audit`
 
 A single paginated GraphQL query returns every public, non-archived repo along
-with whether `SECURITY.md` exists on its default branch:
+with the **text** of its `SECURITY.md`, if any:
 
 ```graphql
-securityMd: object(expression: "HEAD:SECURITY.md") { __typename }
+securityMd: object(expression: "HEAD:SECURITY.md") {
+  ... on Blob { text }
+}
 ```
 
-The job then subtracts the exemption list and emits the results as JSON.
+Pulling the body inline is what makes the content check free — no extra request
+per repo. At 134 repos it adds ~24 KB to the response.
+
+Each repo is then classified into one of three states:
+
+| Status | Meaning |
+| :--- | :--- |
+| `ok` | `SECURITY.md` exists **and** its body matches `POLICY_LINK_PATTERN` |
+| `unlinked` | `SECURITY.md` exists but never references the canonical policy |
+| `missing` | No `SECURITY.md` on the default branch |
+
+The body is tested and then **discarded** — it must not reach the job output,
+which is capped at 1 MB. Only the resulting status travels onward.
+
+The job subtracts the exemption list and emits the results as JSON.
+
+#### Matching the link
+
+`POLICY_LINK_PATTERN` is an extended regex matched case-insensitively:
+
+```yaml
+POLICY_LINK_PATTERN: 'github\.com/konflux-ci/\.github'
+```
+
+It is deliberately **not** an exact comparison against `POLICY_URL`. Real stubs
+link via `/blob/main/`, `/blob/HEAD/`, `/security/policy`, or
+`?tab=security-ov-file`, and all of those are correct. In konflux-ci every
+existing stub uses `/blob/main/` while `POLICY_URL` is written `/blob/HEAD/`, so
+a literal match would have flagged all 91 conforming repos as broken.
+
+The trade-off is that the check verifies the file *points at* the canonical
+policy — not that it says anything sensible around the link.
 
 ### `report`
 
@@ -52,8 +85,9 @@ missing `SECURITY.md`. See [Reading the run status](#reading-the-run-status).
 ## What the report shows
 
 - Compliance counts and a 20-cell coverage bar
-- A table of non-compliant repos with their default branch, each linked to the
-  repository
+- A table of repos missing `SECURITY.md`, with their default branch
+- A separate table of repos whose `SECURITY.md` does not link to the canonical
+  policy, each linked to the offending file
 - Collapsible lists of compliant repos and of exemptions with their reasons
 - A `::warning` annotation per non-compliant repo
 - A failing exit if anything is missing
@@ -107,7 +141,9 @@ The list is edited by hand. The workflow only reads it.
 
 ## Setup
 
-1. Set `ORG_NAME` and `POLICY_URL` in the workflow's `env:` block.
+1. Set `ORG_NAME`, `POLICY_URL`, and `POLICY_LINK_PATTERN` in the workflow's
+   `env:` block. The pattern must match however your stubs actually link back —
+   check a few real files before trusting it.
 2. Add `ORG_MONITOR_TOKEN` as a repository secret. **Read access only** — the
    workflow never writes to any repository, and no write scope is required.
 3. Commit `.github/security-md-exemptions.yaml` alongside the workflow. It is
@@ -127,9 +163,17 @@ The list is edited by hand. The workflow only reads it.
   branch column. Consider exempting them outright.
 - **Archived and private repos are out of scope** by construction, filtered in
   the GraphQL query rather than after the fact.
-- **Presence, not content.** The audit checks that `SECURITY.md` exists; it does
-  not verify the file actually links back to the canonical policy. A repo with a
-  divergent hand-written copy counts as compliant.
+- **A hand-written policy counts as non-conforming.** A repo with its own
+  substantive `SECURITY.md` that never links to the canonical one is reported as
+  `unlinked` and fails the gate, because the stated goal is a single centrally
+  maintained policy. If you would rather treat that as acceptable, drop
+  `UNLINKED` from the `NONCONFORMING` sum in `compliance-gate` — it then stays
+  in the report as advisory only.
+- **Root only.** The audit reads `SECURITY.md` at the repository root. GitHub
+  also honours `.github/SECURITY.md` and `docs/SECURITY.md`; neither is used
+  anywhere in konflux-ci (verified 2026-09-23), so the root-only check is not
+  currently missing anything. Add more `object(expression:)` aliases if that
+  changes.
 - **New repos are the main source of drift.** Compliance correlates strongly
   with repo age — recently created repos are the least likely to have the file.
   A nightly audit will keep finding new gaps; seeding the stub at repo-creation
