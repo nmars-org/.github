@@ -9,50 +9,45 @@
 # eventually remove.
 
 exemptions:
-  - repo: community-operators-prod
-    reason: Fork of third-party OperatorHub metadata with its own upstream policy.
-  - repo: curated-data
-    reason: "Not applicable"
   - repo: .github
-    reason: "Not applicable"
+    reason: "Configuration repo for the organization"
   - repo: brand-assets
-    reason: "Not applicable"
+    reason: "No code"
   - repo: discussions
-    reason: "Not applicable"
-  - repo: e2e-tests
-    reason: "Not applicable"
+    reason: "Inactive, no code"
   - repo: .fullsend
-    reason: "Not applicable"
+    reason: "Not used after per-repo migration"
   - repo: konflux-casc
-    reason: "Not applicable"
+    reason: "Unused"
   - repo: llm-compressor-container
-    reason: "Not applicable"
+    reason: "Unused"
   - repo: multi-arch-konflux-example
-    reason: "Not applicable"
+    reason: "Demo repo"
   - repo: multi-arch
-    reason: "Not applicable"
+    reason: "Unused"
   - repo: multi-version-konflux-stage-sample
-    reason: "Not applicable"
+    reason: "Demo repo"
   - repo: namespace-generator
-    reason: "Not applicable"
+    reason: "Unused"
+  - repo: osv-offline
+    reason: "Content copy of redhat-exd-rebuilds/osv-offline, a fork of upstream renovatebot/osv-offline"
   - repo: planning
-    reason: "Not applicable"
+    reason: "Unused"
   - repo: prioritize
-    reason: "Not applicable"
+    reason: "Used for Jira"
   - repo: pr-review-webhook
-    reason: "Not applicable"
+    reason: "Demo repo"
   - repo: release-service-docs
-    reason: "Not applicable"
+    reason: "Documentation repo"
   - repo: rpmbuild-pipeline-monorepo-mock-config-test
-    reason: "Not applicable"
+    reason: "Unused"
   - repo: rpmbuild-pipeline-test-sources
-    reason: "Not applicable"
+    reason: "Unused"
   - repo: sample-component-golang
-    reason: "Not applicable"
+    reason: "Demo repo for onboarding"
   - repo: support
-    reason: "Not applicable"
+    reason: "Used for issue tracking, no code"
   - repo: testrepo
-    reason: "Not applicable"
+    reason: "Demo repo for testing"
   - repo: tests-common-packages
-    reason: "Not applicable"
-
+    reason: "Empty repo"

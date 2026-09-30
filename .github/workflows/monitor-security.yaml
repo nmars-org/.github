@@ -40,7 +40,8 @@ jobs:
 
           # A single GraphQL query returns each repo *and* whether SECURITY.md
           # exists on its default branch, 100 repos per page. This replaces one
-          # REST list call plus one contents call per repo.
+          # REST list call plus one contents call per repo. Forks are excluded:
+          # their security policy belongs to the upstream project.
           read -r -d '' QUERY <<'GRAPHQL' || true
           query($org: String!, $endCursor: String) {
             organization(login: $org) {
@@ -49,6 +50,7 @@ jobs:
                 after: $endCursor
                 privacy: PUBLIC
                 isArchived: false
+                isFork: false
                 orderBy: {field: NAME, direction: ASC}
               ) {
                 pageInfo { hasNextPage endCursor }
@@ -67,7 +69,7 @@ jobs:
             gh api graphql --paginate -f query="$QUERY" -F org="$ORG_NAME" |
               jq -sc '[.[].data.organization.repositories.nodes[]]'
           )
-          echo "Discovered $(jq 'length' <<<"$ALL") public, non-archived repos."
+          echo "Discovered $(jq 'length' <<<"$ALL") public, non-archived, non-fork repos."
 
           # Always produce a JSON array, including when the key is absent.
           EXEMPT=$(yq -o=json -I=0 '(.exemptions // []) | map(.repo)' "$EXEMPTIONS_FILE")
@@ -80,7 +82,7 @@ jobs:
             --argjson found "$(jq -c '[.[].name]' <<<"$ALL")" \
             '$ex - $found | .[]' |
             while read -r STALE_REPO; do
-              echo "::warning title=Stale Exemption::'${STALE_REPO}' is exempted in ${EXEMPTIONS_FILE} but is not a public, non-archived repo in ${ORG_NAME}. Consider removing the entry."
+              echo "::warning title=Stale Exemption::'${STALE_REPO}' is exempted in ${EXEMPTIONS_FILE} but is not a public, non-archived, non-fork repo in ${ORG_NAME}. Consider removing the entry."
             done
 
           RESULTS=$(

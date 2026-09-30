@@ -1,7 +1,7 @@
 # Org SECURITY.md Auditor
 
-`monitor-security.yaml` audits every public, non-archived repository in the
-organization for a `SECURITY.md` on its default branch and publishes a
+`monitor-security.yaml` audits every public, non-archived, non-fork repository
+in the organization for a `SECURITY.md` on its default branch and publishes a
 consolidated report to the workflow run summary.
 
 Runs nightly at 00:00 UTC, and on demand via **Run workflow**.
@@ -28,8 +28,8 @@ Three jobs.
 
 ### `audit`
 
-A single paginated GraphQL query returns every public, non-archived repo along
-with whether `SECURITY.md` exists on its default branch:
+A single paginated GraphQL query returns every public, non-archived, non-fork
+repo along with whether `SECURITY.md` exists on its default branch:
 
 ```graphql
 securityMd: object(expression: "HEAD:SECURITY.md") { __typename }
@@ -101,7 +101,7 @@ one organization.
 
 Entries that no longer match a repo in scope emit a **stale exemption** warning
 rather than failing silently, so the list does not rot as repos are renamed,
-archived, or deleted.
+archived, forked, or deleted.
 
 The list is edited by hand. The workflow only reads it.
 
@@ -125,8 +125,9 @@ The list is edited by hand. The workflow only reads it.
 - **Repos with zero commits** have no default branch, so they cannot hold a
   `SECURITY.md`. They are flagged as `_none — empty repo, no commits_` in the
   branch column. Consider exempting them outright.
-- **Archived and private repos are out of scope** by construction, filtered in
-  the GraphQL query rather than after the fact.
+- **Archived, private, and forked repos are out of scope** by construction,
+  filtered in the GraphQL query rather than after the fact. A fork's security
+  policy belongs to its upstream project, not to this org.
 - **Presence, not content.** The audit checks that `SECURITY.md` exists; it does
   not verify the file actually links back to the canonical policy. A repo with a
   divergent hand-written copy counts as compliant.
